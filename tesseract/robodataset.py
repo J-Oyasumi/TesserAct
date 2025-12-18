@@ -708,6 +708,321 @@ class RoboDepthNormal(RoboDepth):
         }
 
 
+class RoboPointmap(RoboDataset):
+    """
+    Dataset for RGB + Pointmap data.
+    Pointmap is stored as [T, H, W, 3] containing XYZ coordinates.
+    """
+    def __init__(
+        self,
+        data_root: str,
+        dataset_file: Optional[str] = None,
+        caption_column: str = "text",
+        video_column: str = "video",
+        max_num_frames: int = 49,
+        id_token: Optional[str] = None,
+        height_buckets: List[int] = None,
+        width_buckets: List[int] = None,
+        frame_buckets: List[int] = None,
+        load_tensors: bool = False,
+        random_flip: Optional[float] = None,
+        image_to_video: bool = False,
+    ) -> None:
+        super().__init__(
+            data_root=data_root,
+            dataset_file=dataset_file,
+            caption_column=caption_column,
+            video_column=video_column,
+            max_num_frames=max_num_frames,
+            id_token=id_token,
+            height_buckets=height_buckets,
+            width_buckets=width_buckets,
+            frame_buckets=frame_buckets,
+            load_tensors=load_tensors,
+            random_flip=random_flip,
+            image_to_video=image_to_video,
+        )
+
+    def _read_pointmap_data(self, path: Path) -> np.ndarray:
+        """
+        Reads a pointmap data file in .npz format and returns it as a [T, H, W, 3] numpy array.
+
+        Args:
+            path: Path to the pointmap.npz file
+
+        Returns:
+            pointmap_array: [T, H, W, 3] array containing XYZ coordinates
+        """
+        assert path.is_file(), f"Pointmap file {path} does not exist."
+        pointmap_array = np.load(path)["point_map"].astype(np.float32)
+        mask = np.load(path)["mask"]
+        # Check if All points are valid
+        if not np.all(mask):
+            logger.warning(f"Pointmap file {path} contains invalid points.")
+            
+        # Ensure shape is [T, H, W, 3]
+        if len(pointmap_array.shape) == 3:
+            # If shape is [T, H, W], expand to [T, H, W, 1] and repeat for 3 channels
+            logger.warning(f"Pointmap has shape {pointmap_array.shape}, expected [T, H, W, 3]. Expanding to 3 channels.")
+            pointmap_array = np.expand_dims(pointmap_array, axis=-1)
+            pointmap_array = np.repeat(pointmap_array, 3, axis=-1)
+
+        return pointmap_array
+
+    def _load_and_normalize_pointmap(self, rgb_dir: Path, num_frames: int) -> Tuple[List[np.ndarray], bool]:
+        """
+        Load and normalize pointmap data while preserving spatial proportions.
+
+        Args:
+            rgb_dir: Path to RGB video file
+            num_frames: Number of frames in RGB video
+
+        Returns:
+            pointmap_frames: List of normalized pointmap frames [H, W, 3] or None
+            have_pointmap: Boolean indicating if pointmap exists
+        """
+        # Construct pointmap path: video/rgb.mp4 -> pointmap/npz/pointmap.npz
+        pointmap_path = Path(str(rgb_dir).replace("video/rgb.mp4", "pointmap/npz/pointmap.npz"))
+
+        # Also handle directory-based paths: image/rgb -> pointmap/npz/pointmap.npz
+        if rgb_dir.is_dir():
+            pointmap_path = Path(str(rgb_dir.parent.parent) + "/pointmap/npz/pointmap.npz")
+
+        if not pointmap_path.exists():
+            return None, False
+
+        try:
+            pointmap_array = self._read_pointmap_data(pointmap_path)  # [T, H, W, 3]
+
+            # Normalize XYZ coordinates to [-1, 1] while preserving spatial proportions
+            x_min, x_max = pointmap_array[..., 0].min(), pointmap_array[..., 0].max()
+            y_min, y_max = pointmap_array[..., 1].min(), pointmap_array[..., 1].max()
+            z_min, z_max = pointmap_array[..., 2].min(), pointmap_array[..., 2].max()
+
+            # Calculate center and scale
+            center = np.array([
+                (x_max + x_min) / 2,
+                (y_max + y_min) / 2,
+                (z_max + z_min) / 2
+            ])
+
+            # Use the maximum range across all axes to preserve aspect ratio
+            scale = max(x_max - x_min, y_max - y_min, z_max - z_min)
+
+            # Normalize: center at origin, then scale to [-1, 1]
+            if scale > 1e-8:
+                pointmap_array = 2 * (pointmap_array - center) / scale
+            else:
+                pointmap_array = np.zeros_like(pointmap_array)
+
+            # Adjust frame count to match RGB
+            pointmap_frames = list(pointmap_array)  # Convert to list of [H, W, 3]
+            if len(pointmap_frames) != num_frames:
+                logger.warning(
+                    f"{pointmap_path} RGB {num_frames} != POINTMAP {len(pointmap_frames)}"
+                )
+                pointmap_frames = self._adjust_num_frames(pointmap_frames, num_frames)
+
+            return pointmap_frames, True
+
+        except Exception as e:
+            logger.error(f"Error loading pointmap from {pointmap_path}: {e}")
+            return None, False
+
+    def get_pointmap_data(self, rgb_dir: Path, rgb_video: torch.Tensor, target_size: Tuple[int, int]) -> Tuple[torch.Tensor, bool]:
+        """
+        Load and process pointmap data corresponding to the RGB video.
+
+        Args:
+            rgb_dir: Path to RGB video file
+            rgb_video: RGB video tensor [T, 3, H, W]
+            target_size: Target (height, width) for resizing
+
+        Returns:
+            pointmap_video: Processed pointmap tensor [T, 3, H, W], normalized to [-1, 1]
+            have_pointmap: Boolean indicating if pointmap data exists
+        """
+        # Construct pointmap path: video/rgb.mp4 -> pointmap/npz/pointmap.npz
+        pointmap_path = Path(str(rgb_dir).replace("video/rgb.mp4", "pointmap/npz/pointmap.npz"))
+
+        # Also handle directory-based paths: image/rgb -> pointmap/npz/pointmap.npz
+        if rgb_dir.is_dir():
+            pointmap_path = Path(str(rgb_dir.parent.parent) + "/pointmap/npz/pointmap.npz")
+
+        if pointmap_path.exists():
+            try:
+                pointmap_array = self._read_pointmap_data(pointmap_path)  # [T, H, W, 3]
+
+                # Normalize XYZ coordinates to [-1, 1] while preserving spatial proportions
+                # Find global min/max for each axis across all frames
+                x_min, x_max = pointmap_array[..., 0].min(), pointmap_array[..., 0].max()
+                y_min, y_max = pointmap_array[..., 1].min(), pointmap_array[..., 1].max()
+                z_min, z_max = pointmap_array[..., 2].min(), pointmap_array[..., 2].max()
+
+                # Calculate center and scale
+                center_x = (x_max + x_min) / 2
+                center_y = (y_max + y_min) / 2
+                center_z = (z_max + z_min) / 2
+                center = np.array([center_x, center_y, center_z])
+
+                # Use the maximum range across all axes to preserve aspect ratio
+                scale = max(x_max - x_min, y_max - y_min, z_max - z_min)
+
+                # Normalize: center at origin, then scale to [-1, 1]
+                if scale > 1e-8:  # Avoid division by zero
+                    pointmap_array = 2 * (pointmap_array - center) / scale
+                else:
+                    pointmap_array = np.zeros_like(pointmap_array)
+
+                # Resize to target size
+                pointmap_frames = crop_and_resize_frames(
+                    [pointmap_array[t] for t in range(pointmap_array.shape[0])],
+                    target_size,
+                    interpolation="bilinear"
+                )
+
+                # Convert to tensor (already normalized to [-1, 1])
+                # Note: We don't apply video_transforms because pointmap is already normalized
+                pointmap_video = []
+                for frame in pointmap_frames:
+                    # Convert to torch and permute to [C, H, W]
+                    frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float()
+                    pointmap_video.append(frame_tensor.unsqueeze(0))
+
+                pointmap_video = torch.cat(pointmap_video, dim=0)  # [T, 3, H, W]
+
+                # Adjust frame count to match RGB video
+                if len(rgb_video) != len(pointmap_video):
+                    logger.warning(
+                        f"{pointmap_path} RGB {len(rgb_video)} != POINTMAP {len(pointmap_video)}"
+                    )
+                    pointmap_video = self._adjust_num_frames(list(pointmap_video), len(rgb_video))
+                    pointmap_video = torch.stack(pointmap_video, dim=0)  # [T, 3, H, W]
+
+                have_pointmap = True
+
+            except Exception as e:
+                logger.error(f"Error loading pointmap from {pointmap_path}: {e}")
+                pointmap_video = torch.zeros_like(rgb_video)
+                have_pointmap = False
+        else:
+            # If pointmap doesn't exist, return zeros
+            pointmap_video = torch.zeros_like(rgb_video)
+            have_pointmap = False
+
+        return pointmap_video, have_pointmap
+
+    def _preprocess_video(self, path: Path) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        """
+        Overrides the parent class method to load both RGB and pointmap data.
+        Ensures RGB and Pointmap undergo identical transformations (crop, resize, flip).
+
+        Args:
+            path: Path to RGB video file or directory
+
+        Returns:
+            image: First frame as image [1, 6, H, W]
+            video: Concatenated RGB+Pointmap video [T, 6, H, W]
+            have_pointmap: Boolean mask indicating if pointmap exists
+        """
+        # Sample target size (same for both RGB and pointmap)
+        target_size = random.choice(list(DATASET2RES.values()))
+
+        # Decide if we should flip (before any processing)
+        should_flip = self.random_flip and random.random() < self.random_flip
+
+        # ==== Load RGB frames =====
+        rgb_dir = path
+        rgb_frames = self._read_rgb_data(rgb_dir)  # [T, H, W, 3]
+
+        # ==== Load pointmap data =====
+        pointmap_frames, have_pointmap = self._load_and_normalize_pointmap(rgb_dir, len(rgb_frames))
+        # pointmap_frames: [T, H, W, 3] or None
+
+        # ==== Apply SAME crop and resize to both =====
+        rgb_frames = crop_and_resize_frames(rgb_frames, target_size)
+        if have_pointmap:
+            pointmap_frames = crop_and_resize_frames(pointmap_frames, target_size)
+
+        # ==== Apply SAME horizontal flip to both =====
+        if should_flip:
+            rgb_frames = [np.fliplr(frame) for frame in rgb_frames]
+            if have_pointmap:
+                pointmap_frames = [np.fliplr(frame) for frame in pointmap_frames]
+                # CRITICAL: Flip X coordinate when flipping horizontally
+                for frame in pointmap_frames:
+                    frame[..., 0] *= -1
+
+        # ==== Convert to tensors with appropriate transforms =====
+        # RGB: apply standard video_transforms (scale + normalize)
+        rgb_video = []
+        for frame in rgb_frames:
+            frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float()
+            # Apply only scale and normalize (flip already done)
+            frame_tensor = frame_tensor / 255.0  # [0, 1]
+            frame_tensor = (frame_tensor - 0.5) / 0.5  # [-1, 1]
+            rgb_video.append(frame_tensor.unsqueeze(0))
+        rgb_video = torch.cat(rgb_video, dim=0)  # [T, 3, H, W]
+
+        # Pointmap: convert to tensor (already normalized to [-1, 1])
+        if have_pointmap:
+            pointmap_video = []
+            for frame in pointmap_frames:
+                frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float()
+                pointmap_video.append(frame_tensor.unsqueeze(0))
+            pointmap_video = torch.cat(pointmap_video, dim=0)  # [T, 3, H, W]
+        else:
+            pointmap_video = torch.zeros_like(rgb_video)
+
+        # ==== Concatenate RGB and pointmap ====
+        concatenated_video = torch.cat((rgb_video, pointmap_video), dim=1)  # [T, 6, H, W]
+
+        # Adjust frames to match max_num_frames
+        concatenated_video = self._adjust_num_frames(list(concatenated_video))
+        concatenated_video = torch.stack(concatenated_video, dim=0)  # [T, 6, H, W]
+
+        image = concatenated_video[:1].clone()  # [1, 6, H, W]
+
+        return image, concatenated_video, have_pointmap
+
+    def getitem(self, index: int) -> Dict[str, Any]:
+        """
+        Get a single sample with RGB + Pointmap data.
+
+        Returns:
+            Dictionary containing:
+                - prompt: Text instruction with robot name
+                - image: First frame [1, 6, H, W]
+                - video: Full video [T, 6, H, W]
+                - mask: Boolean indicating if pointmap exists
+                - video_metadata: Frame count and resolution
+                - path: Path to the RGB video
+        """
+        if isinstance(index, list):
+            # Special logic for bucket sampler
+            return index
+
+        if self.load_tensors:
+            raise NotImplementedError("Loading tensors is not supported.")
+
+        sample = self.samples[index]
+        image, video, have_pointmap = self._preprocess_video(Path(sample[1]))
+        instruction = self.get_instruction(index)
+
+        return {
+            "prompt": self.id_token + instruction,
+            "image": image,
+            "video": video,
+            "mask": have_pointmap,  # Single boolean for pointmap
+            "video_metadata": {
+                "num_frames": video.shape[0],
+                "height": video.shape[2],
+                "width": video.shape[3],
+            },
+            "path": sample[1],
+        }
+
+
 class BucketSampler(Sampler):
     def __init__(
         self,
